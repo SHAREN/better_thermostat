@@ -162,6 +162,7 @@ _BOOL_FIELDS = frozenset(
         "regime_boost_active",
         "tolerance_hold_active",
         "auto_tune",
+        "balance_coastdown",
     }
 )
 

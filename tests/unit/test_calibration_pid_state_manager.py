@@ -88,6 +88,38 @@ def test_pid_balance_threads_the_same_state_across_calls() -> None:
     assert first.previous_abs_error == 2.0
 
 
+def test_balanced_pid_accepts_percent_mapped_vaillant_climate_proxy() -> None:
+    """A 0..100 setpoint proxy is a servo, even without direct valve support."""
+    state_mgr = _PidStateStub()
+    bt = _make_bt(state_mgr)
+    trv = bt.real_trvs["climate.trv"]
+    trv.advanced.update({"calibration": "target_temp_based", "pid_balance_mode": True})
+    trv.min_temp = 0
+    trv.max_temp = 100
+    trv.current_temperature = 0
+    bt.cur_temp = 21.95
+    bt.cur_temp_filtered = None
+    bt.heating_power = 0.0062
+    bt.heat_loss_rate = 0.00114
+
+    percent, direct = _compute_pid_balance(bt, "climate.trv")
+    assert percent is not None
+    assert direct is False
+    assert trv.calibration_balance["debug"]["mode"] == "pid_balance"
+    assert trv.calibration_balance["debug"]["base"] is not None
+
+
+def test_balanced_pid_will_not_apply_percent_to_ordinary_climate_setpoint() -> None:
+    """Even if requested, a normal 5..30°C TRV stays on the classic PID."""
+    state_mgr = _PidStateStub()
+    bt = _make_bt(state_mgr)
+    trv = bt.real_trvs["climate.trv"]
+    trv.advanced.update({"calibration": "target_temp_based", "pid_balance_mode": True})
+
+    _compute_pid_balance(bt, "climate.trv")
+    assert trv.calibration_balance["debug"]["mode"] == "pid"
+
+
 def test_pid_balance_ignores_the_room_sensor_filter_during_the_trv_fallback() -> None:
     """The filter still holds the lost sensor's readings; PID uses the TRV value."""
     state_mgr = _PidStateStub()

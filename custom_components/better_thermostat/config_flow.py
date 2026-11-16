@@ -26,11 +26,7 @@ from homeassistant.helpers.dispatcher import dispatcher_send
 from homeassistant.util.unit_conversion import TemperatureConverter
 import voluptuous as vol
 
-from . import (  # pylint: disable=unused-import
-    DOMAIN,
-    other_entries_controlling,
-    trv_entity_ids,
-)
+from . import DOMAIN, other_entries_controlling, trv_entity_ids  # pylint: disable=unused-import
 from .adapters.delegate import load_adapter
 from .model_fixes.model_quirks import load_model_quirks, quirk_writes_valve
 from .utils.const import (
@@ -50,6 +46,7 @@ from .utils.const import (
     CONF_NO_SYSTEM_MODE_OFF,
     CONF_OFF_TEMPERATURE,
     CONF_OUTDOOR_SENSOR,
+    CONF_PID_BALANCE_MODE,
     CONF_PRESETS,
     CONF_PROTECT_OVERHEATING,
     CONF_SENSOR,
@@ -447,6 +444,11 @@ def _build_advanced_fields(
             default=get_value(CONF_MPC_V2_PLANT_PRESET, MpcV2PlantPreset.AUTO),
         )
     ] = MPC_V2_PLANT_PRESET_SELECTOR
+    ordered[
+        vol.Optional(
+            CONF_PID_BALANCE_MODE, default=get_bool(CONF_PID_BALANCE_MODE, False)
+        )
+    ] = bool
 
     ordered[
         vol.Optional(
@@ -494,6 +496,9 @@ def _normalize_advanced_submission(
     )
     normalized[CONF_HEAT_AUTO_SWAPPED] = _as_bool(
         normalized.get(CONF_HEAT_AUTO_SWAPPED), False
+    )
+    normalized[CONF_PID_BALANCE_MODE] = _as_bool(
+        normalized.get(CONF_PID_BALANCE_MODE), False
     )
     normalized[CONF_VALVE_MAINTENANCE] = _as_bool(
         normalized.get(CONF_VALVE_MAINTENANCE), False

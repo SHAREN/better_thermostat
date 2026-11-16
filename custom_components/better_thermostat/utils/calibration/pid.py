@@ -39,6 +39,7 @@ class PIDDebugInfo(TypedDict, total=False):
     error: str
     dt_s: float | None
     e_K: float | None
+    base: float | None
     p: float | None
     i: float | None
     d: float | None
@@ -87,6 +88,10 @@ class PIDState:
     # Hold-time
     last_output_change_ts: float = 0.0
     last_target_temp: float | None = None
+    # Persistent equilibrium estimate for the opt-in balanced valve controller.
+    balance_base_pct: float | None = None
+    balance_integral_pct: float = 0.0
+    balance_coastdown: bool = False
 
 
 # --- PID Parameters -----------------------------------------------
@@ -144,6 +149,13 @@ class PIDParams:
     # Hold-time
     min_hold_time_s: float = 300.0
     big_change_threshold_pct: float = 33.0
+    # Opt-in balance control: keep legacy PID behavior unchanged by default.
+    balance_enabled: bool = False
+    balance_kp: float = 24.0  # percentage points / °C
+    balance_ki: float = 0.003  # percentage points / (°C * s)
+    balance_kd: float = 180.0  # percentage points / (°C/min)
+    balance_slew_pct_per_min: float = 1.5
+    balance_overshoot_cutoff_K: float = 0.25
 
 
 # --- Helper Functions -----------------------------------------------
@@ -184,6 +196,170 @@ def _forget_stamps_from_a_previous_uptime(state: PIDState, now: float) -> None:
     state.last_error_sign = None
 
 
+def _compute_balanced_pid(
+    params: PIDParams,
+    target_C: float | None,
+    current_C: float | None,
+    slope_K_min: float | None,
+    key: str,
+    *,
+    state: PIDState,
+    now: float,
+    max_opening_pct: float | None,
+    heating_power_C_min: float | None,
+    heat_loss_C_min: float | None,
+) -> tuple[float, PIDDebugInfo, PIDState]:
+    """Hold a learned heat-loss baseline with bounded, slow PI+D corrections.
+
+    The prior from learned rates is only an initial estimate: heating_power is
+    learned during complete heating cycles, not at a known 100% actuator
+    position. The persistent I correction adapts this prior to the actual
+    emitter without treating the estimate as a calibrated valve fraction.
+    """
+    st = state
+
+    def finite(value: float | None) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    if not finite(target_C) or not finite(current_C):
+        st.last_percent = 0.0
+        st.pid_last_time = now
+        return 0.0, {"mode": "pid_balance", "error": "no_temps"}, st
+
+    target = float(target_C)
+    current = float(current_C)
+    error = target - current
+    max_opening = (
+        max(0.0, min(100.0, float(max_opening_pct)))
+        if finite(max_opening_pct)
+        else 100.0
+    )
+
+    # Use elapsed monotonic time. First cycle is one nominal 5-minute tick;
+    # prolonged suspension cannot cause a giant integral or output jump.
+    dt = (
+        max(1.0, min(MAX_DT_S, now - st.pid_last_time))
+        if 0 < st.pid_last_time <= now
+        else 300.0
+    )
+    changed_target = (
+        st.last_target_temp is not None and abs(target - st.last_target_temp) > 0.05
+    )
+    st.last_target_temp = target
+    if changed_target:
+        st.balance_integral_pct = 0.0
+
+    # Estimate the required steady heat fraction once and adapt slowly as the
+    # separate thermal trackers refine their learned rates. Both are °C/min;
+    # the ratio is a prior, not a measured percentage of full valve travel.
+    prior = 12.0
+    if (
+        finite(heating_power_C_min)
+        and finite(heat_loss_C_min)
+        and heating_power_C_min > 0
+        and heat_loss_C_min > 0
+    ):
+        prior = max(
+            3.0,
+            min(
+                35.0, 100.0 * heat_loss_C_min / (heating_power_C_min + heat_loss_C_min)
+            ),
+        )
+    if st.balance_base_pct is None or not finite(st.balance_base_pct):
+        st.balance_base_pct = prior
+    else:
+        alpha = min(1.0, dt / (4.0 * 3600.0))
+        st.balance_base_pct += alpha * (prior - st.balance_base_pct)
+        st.balance_base_pct = max(0.0, min(40.0, st.balance_base_pct))
+
+    # Derivative uses the existing EMA of the room-temperature slope.
+    # Unlike an instantaneous dT/dt, it cannot blow up on short HA callbacks.
+    if finite(slope_K_min):
+        if st.ema_slope is None or not finite(st.ema_slope):
+            st.ema_slope = float(slope_K_min)
+        else:
+            st.ema_slope = 0.8 * st.ema_slope + 0.2 * float(slope_K_min)
+    slope = st.ema_slope if finite(st.ema_slope) else 0.0
+    p_term = params.balance_kp * error
+    d_term = max(-12.0, min(12.0, -params.balance_kd * slope))
+
+    proposed_integral = max(
+        -30.0, min(45.0, st.balance_integral_pct + params.balance_ki * error * dt)
+    )
+    trial = st.balance_base_pct + p_term + proposed_integral + d_term
+    blocked = (trial < 0 and error < 0) or (trial > max_opening and error > 0)
+    if not blocked:
+        st.balance_integral_pct = proposed_integral
+    requested = max(
+        0.0,
+        min(
+            max_opening, st.balance_base_pct + p_term + st.balance_integral_pct + d_term
+        ),
+    )
+
+    # Fail-safe: stop promptly, then coast down until close to the new target.
+    # A retained coastdown latch prevents resuming heat on the next 5-minute
+    # tick while the room is still above a newly lowered setpoint.
+    if current >= target + params.balance_overshoot_cutoff_K or (
+        changed_target and current >= target + 0.05
+    ):
+        st.balance_coastdown = True
+    if st.balance_coastdown and current <= target + 0.03:
+        st.balance_coastdown = False
+
+    # Fail-safe: immediately stop heating for a measured overshoot or when
+    # the setpoint was lowered below the current room temperature.
+    cutoff = (
+        st.balance_coastdown
+        or (changed_target and current >= target + 0.05)
+        or max_opening == 0
+    )
+    if cutoff:
+        requested = 0.0
+        st.balance_integral_pct = min(0.0, st.balance_integral_pct)
+    else:
+        max_step = max(0.0, params.balance_slew_pct_per_min) * dt / 60.0
+        requested = max(
+            st.last_percent - max_step, min(st.last_percent + max_step, requested)
+        )
+    percent = int(round(max(0.0, min(max_opening, requested))))
+    if percent != st.last_percent:
+        st.last_output_change_ts = now
+    st.last_percent = percent
+    st.pid_last_error = error
+    st.pid_last_meas = current
+    st.pid_last_time = now
+
+    debug: PIDDebugInfo = {
+        "mode": "pid_balance",
+        "dt_s": _r(dt, 2),
+        "e_K": _r(error, 3),
+        "p": _r(p_term, 2),
+        "i": _r(st.balance_integral_pct, 2),
+        "d": _r(d_term, 2),
+        "u": _r(requested, 2),
+        "kp": params.balance_kp,
+        "ki": params.balance_ki,
+        "kd": params.balance_kd,
+        "base": _r(st.balance_base_pct, 2),
+        "anti_windup_blocked": blocked,
+        "slope_ema": _r(slope, 4),
+        "meas_current_used": _r(current, 2),
+    }
+    _LOGGER.debug(
+        "better_thermostat PID balance: %s valve=%s baseline=%.1f error=%.3f",
+        key,
+        percent,
+        st.balance_base_pct,
+        error,
+    )
+    return float(percent), debug, st
+
+
 def compute_pid(
     params: PIDParams,
     inp_target_temp_C: float | None,
@@ -195,6 +371,8 @@ def compute_pid(
     max_opening_pct: float | None = None,
     *,
     state: PIDState,
+    heating_power_C_min: float | None = None,
+    heat_loss_C_min: float | None = None,
 ) -> tuple[float, PIDDebugInfo, PIDState]:
     """Compute PID-based valve opening percentage.
 
@@ -220,6 +398,10 @@ def compute_pid(
         Mutable controller state, owned by the caller (typically read from
         and written back to the ``StateManager``).  It is mutated in place
         and returned.
+    heating_power_C_min:
+        Learned heating rate, only used to estimate an initial baseline.
+    heat_loss_C_min:
+        Learned heat loss rate, only used to estimate an initial baseline.
 
     Returns
     -------
@@ -236,6 +418,21 @@ def compute_pid(
             "better_thermostat: healed poisoned PID state for %s (%s)", key, pathology
         )
     _forget_stamps_from_a_previous_uptime(st, now)
+    if params.balance_enabled:
+        return _compute_balanced_pid(
+            params,
+            inp_target_temp_C,
+            inp_current_temp_ema_C
+            if inp_current_temp_ema_C is not None
+            else inp_current_temp_C,
+            inp_temp_slope_K_per_min,
+            key,
+            state=st,
+            now=now,
+            max_opening_pct=max_opening_pct,
+            heating_power_C_min=heating_power_C_min,
+            heat_loss_C_min=heat_loss_C_min,
+        )
 
     max_opening = 100.0
     if isinstance(max_opening_pct, (int, float)):
@@ -602,6 +799,16 @@ def sanitize_pid_state(
     def _finite(value: float | None) -> bool:
         return value is None or math.isfinite(value)
 
+    if not _finite(state.balance_base_pct):
+        state.balance_base_pct = None
+        pathology = "non-finite state"
+    if not isinstance(state.balance_coastdown, bool):
+        state.balance_coastdown = False
+        pathology = "non-boolean state"
+    if not _finite(state.balance_integral_pct):
+        state.balance_integral_pct = 0.0
+        pathology = "non-finite state"
+    state.balance_integral_pct = max(-30.0, min(45.0, state.balance_integral_pct))
     if not _finite(state.pid_integral):
         state.pid_integral = 0.0
         pathology = "non-finite state"

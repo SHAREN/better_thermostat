@@ -42,6 +42,7 @@ from custom_components.better_thermostat.utils.calibration.tpi import (
 )
 from custom_components.better_thermostat.utils.const import (
     CONF_MPC_V2_PLANT_PRESET,
+    CONF_PID_BALANCE_MODE,
     CONF_PROTECT_OVERHEATING,
     DEFAULT_CALIBRATION_MODE,
     CalibrationMode,
@@ -657,9 +658,23 @@ def _compute_pid_balance(self, entity_id: str):
         trv_state.calibration_balance = None
         return None, False
     pid_state = state_mgr.get_pid(key)
+    supports_valve = _supports_direct_valve_control(self, entity_id)
+    # A 0..100 °C climate proxy encodes servo percentages as setpoints.
+    # Never apply this conversion to ordinary thermostats (5..30 °C).
+    percent_proxy = (
+        trv_state.advanced.get("calibration") == CalibrationType.TARGET_TEMP_BASED
+        and isinstance(trv_state.max_temp, (int, float))
+        and isinstance(trv_state.min_temp, (int, float))
+        and trv_state.min_temp <= 0
+        and trv_state.max_temp >= 95
+    )
+    balance_enabled = (supports_valve or percent_proxy) and trv_state.advanced.get(
+        CONF_PID_BALANCE_MODE, False
+    ) is True
 
     # Use learned gains if available, otherwise from config, otherwise defaults
     params = PIDParams(
+        balance_enabled=balance_enabled,
         kp=(
             pid_state.pid_kp
             if pid_state and pid_state.pid_kp is not None
@@ -699,6 +714,8 @@ def _compute_pid_balance(self, entity_id: str):
             inp_current_temp_ema_C=_filtered_room_temp(self),
             max_opening_pct=_get_trv_max_opening(self, entity_id),
             state=pid_state,
+            heating_power_C_min=getattr(self, "heating_power", None),
+            heat_loss_C_min=getattr(self, "heat_loss_rate", None),
         )
         state_mgr.set_pid(key, pid_state)
     except (ValueError, TypeError, ZeroDivisionError) as err:
